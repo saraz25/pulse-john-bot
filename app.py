@@ -628,11 +628,9 @@ def send_reply_to_highlevel(contact: dict, reply: str):
     url = "https://services.leadconnectorhq.com/conversations/messages"
 
     headers = {
-        "Authorization": f"Bearer {HIGHLEVEL_API_KEY}",
-        "Version": "2021-07-28",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    "hl-api-key": HL_API_KEY,
+    "Content-Type": "application/json"
+}
 
     body = {
         "locationId": location_id,
