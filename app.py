@@ -35,8 +35,9 @@ if not HIGHLEVEL_CALENDAR_ID:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ============================================================
-#        THIS FIXES THE FASTAPI ERROR ON RENDER
+#        FIX FOR FASTAPI ERROR ON RENDER
 # ============================================================
+
 app = FastAPI()
 
 @app.get("/")
@@ -49,6 +50,7 @@ async def health():
 # ============================================================
 
 conversations: dict[str, dict] = {}
+
 
 # ============================================================
 #                  JOHN SYSTEM PROMPT
@@ -74,55 +76,6 @@ Never output anything outside this JSON.
 
 
 # ============================================================
-#                   CONTEXT BUILDER
-# ============================================================
-
-def build_context_text(payload: dict) -> tuple[str, dict]:
-    contact = payload.get("contact") or payload.get("contactDetails") or {}
-    custom = payload.get("custom") or payload.get("customFields") or {}
-
-    # ----- Extract latest customer message -----
-    last_message = None
-    if isinstance(payload.get("message"), str):
-        last_message = payload["message"]
-    elif isinstance(payload.get("body"), str):
-        last_message = payload["body"]
-    elif isinstance(payload.get("conversation"), dict):
-        msg = payload["conversation"].get("message")
-        if isinstance(msg, str):
-            last_message = msg
-
-    # ----- Contact Info -----
-    first_name = contact.get("firstName") or "there"
-
-    services = custom.get("services_interested_in") or custom.get("Services Interested In")
-    colour = custom.get("vehicle_colour") or custom.get("Vehicle Colour")
-    condition = custom.get("vehicle_condition") or custom.get("Vehicle Condition")
-    make_model = custom.get("vehicle_make_model") or custom.get("Vehicle Make & Model")
-    year = custom.get("vehicle_year") or custom.get("Vehicle Year")
-
-    # ----- Build context text for LLM -----
-    lines = []
-
-    lines.append(
-        f"Customer name: {first_name}. "
-        f"Vehicle: {year or 'unknown year'} {make_model or 'unknown model'} in {colour or 'unknown colour'}."
-    )
-
-    if services:
-        lines.append(f"Services selected: {services}.")
-    if condition:
-        lines.append(f"Vehicle condition from survey: {condition}.")
-
-    if last_message:
-        lines.append(f"Latest customer message: {last_message}")
-    else:
-        lines.append("No customer message yet. Start based on survey.")
-
-    return "\n".join(lines), contact
-
-
-# ============================================================
 #           CALL JOHN (OPENAI) WITH STATE MEMORY
 # ============================================================
 
@@ -130,7 +83,7 @@ def call_john(contact_id: str, context_text: str) -> dict:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     history = conversations.get(contact_id, {}).get("history", [])
-    messages.extend(history[-6:])  # last 3 turns
+    messages.extend(history[-6:])
     messages.append({"role": "user", "content": context_text})
 
     completion = client.chat.completions.create(
@@ -152,7 +105,6 @@ def call_john(contact_id: str, context_text: str) -> dict:
             "preferred_time_of_day": None,
         }
 
-    # Save conversation
     history.append({"role": "user", "content": context_text})
     history.append({"role": "assistant", "content": data.get("reply", "")})
     conversations[contact_id] = {"history": history}
@@ -196,7 +148,7 @@ def send_reply_to_highlevel(contact: dict, reply: str):
 
 
 # ============================================================
-#                   CREATE APPOINTMENT
+#                     CREATE APPOINTMENT
 # ============================================================
 
 def create_callback_appointment(contact: dict, date_iso: str, time_of_day: str):
@@ -244,7 +196,7 @@ def create_callback_appointment(contact: dict, date_iso: str, time_of_day: str):
 
 
 # ============================================================
-#               RENDER-FIXED WEBHOOK ENDPOINT
+#         UPDATED WEBHOOK ENDPOINT — SUPPORTS BOTH FORMATS
 # ============================================================
 
 @app.post("/webhook/incoming")
@@ -256,13 +208,42 @@ async def webhook_incoming(request: Request):
 
     print("Incoming HL webhook:", json.dumps(payload)[:800])
 
-    contact = payload.get("contact") or {}
-    contact_id = contact.get("id") or contact.get("contactId")
+    contact = {}
+    last_message = ""
 
+    # NEW Workflow Payload Format
+    if "contact_id" in payload:
+        contact = {
+            "id": payload.get("contact_id"),
+            "firstName": payload.get("first_name"),
+            "lastName": payload.get("last_name"),
+            "fullName": payload.get("full_name"),
+            "locationId": payload.get("location", {}).get("id"),
+            "phone": payload.get("phone"),
+            "email": payload.get("email"),
+        }
+        last_message = payload.get("message") or ""
+
+    # OLD HighLevel Chat Payload Format
+    else:
+        contact = payload.get("contact") or {}
+        last_message = (
+            payload.get("message")
+            or payload.get("body")
+            or payload.get("conversation", {}).get("message")
+            or ""
+        )
+
+    contact_id = contact.get("id")
     if not contact_id:
         raise HTTPException(status_code=400, detail="Missing contactId")
 
-    context_text, contact = build_context_text(payload)
+    # Build simple context for John
+    context_text = f"""
+Customer name: {contact.get('firstName', 'there')}.
+Latest customer message: {last_message}
+"""
+
     ai = call_john(contact_id, context_text)
 
     reply = ai.get("reply")
