@@ -38,9 +38,12 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 #        THIS FIXES THE FASTAPI ERROR ON RENDER
 # ============================================================
 app = FastAPI()
+
 @app.get("/")
-async def root():
+async def health():
     return {"status": "ok", "message": "Pulse John Bot is running"}
+
+
 # ============================================================
 #     IN-MEMORY CONVERSATION MEMORY PER CONTACT
 # ============================================================
@@ -274,12 +277,3 @@ async def webhook_incoming(request: Request):
         create_callback_appointment(contact, date_iso, time_of_day)
 
     return JSONResponse({"status": "ok"})
-
-
-# ============================================================
-#                  HEALTH CHECK ROUTE
-# ============================================================
-
-@app.get("/")
-async def home():
-    return {"status": "Pulse John Bot Running!"}
