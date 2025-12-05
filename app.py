@@ -38,7 +38,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 #        THIS FIXES THE FASTAPI ERROR ON RENDER
 # ============================================================
 app = FastAPI()
-
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Pulse John Bot is running"}
 # ============================================================
 #     IN-MEMORY CONVERSATION MEMORY PER CONTACT
 # ============================================================
