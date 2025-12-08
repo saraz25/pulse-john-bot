@@ -196,7 +196,6 @@ def build_context_text(payload: dict):
     if last_message:
         lines.append(f"Latest customer message: {last_message}")
     else:
-        # This line is needed for history checks but is now bypassed by the webhook logic for the first message
         lines.append("There is no customer message yet. DO NOT REPLY.")
 
     return "\n".join(lines), contact
@@ -238,7 +237,7 @@ def call_john(contact_id: str, context_text: str):
 
 
 # ============================================================
-#           SEND MESSAGE BACK INTO HIGHLEVEL (FIXED)
+#           SEND MESSAGE BACK INTO HIGHLEVEL (FIXED AUTHORIZATION)
 # ============================================================
 
 def send_reply_to_highlevel(contact: dict, reply: str):
@@ -248,8 +247,9 @@ def send_reply_to_highlevel(contact: dict, reply: str):
     url = "https://services.leadconnectorhq.com/conversations/messages"
 
     headers = {
-        "hl-api-key": HIGHLEVEL_API_KEY,
-        "Version": "2021-07-28", # CRITICAL FIX: Required by HL API for message sending
+        "hl-api-key": HIGHLEVEL_API_KEY, 
+        "Authorization": f"Bearer {HIGHLEVEL_API_KEY}", # CRITICAL FIX for 401 Error
+        "Version": "2021-07-28", 
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -264,7 +264,13 @@ def send_reply_to_highlevel(contact: dict, reply: str):
 
     print("Sending HL reply:", body)
     resp = requests.post(url, headers=headers, json=body, timeout=15)
-    print("HL REPLY STATUS:", resp.status_code, resp.text[:500])
+    
+    # Check for success (200 or 201) before printing status
+    if resp.status_code in [200, 201]:
+        print(f"HL REPLY STATUS: {resp.status_code} - Message sent successfully.")
+    else:
+        print(f"HL REPLY STATUS: {resp.status_code} - ERROR: {resp.text[:500]}")
+    
 
 
 # ============================================================
@@ -347,7 +353,7 @@ async def webhook_incoming(request: Request):
         # This is the question you want the bot to ask proactively
         forced_reply = "Great, could you tell me a little more about the condition of the vehicle?"
         
-        # Send the forced reply to HighLevel immediately.
+        # Send the forced reply to HighLevel immediately. This uses the fixed headers.
         send_reply_to_highlevel(contact, forced_reply)
         
         # Return a success response to the HL workflow.
