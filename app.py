@@ -54,20 +54,15 @@ conversations: dict[str, dict] = {}
 #             SYSTEM PROMPT FOR JOHN
 # ============================================================
 
-# NOTE: The actual SYSTEM_PROMPT content is now imported from your separate prompt file
-# For simplicity and to match the rest of the code, I'll keep the variable name,
-# but assume it holds the content of JOHN_SYSTEM_PROMPT.
 SYSTEM_PROMPT = """
 You are “John”, a friendly, professional assistant for Pulse Car Detailing.
-You ALWAYS reply in UK English and you act like a real human team member.
+You ALWAYS reply in UK English and sound human, natural, and short.
 
 ================================================
 CRITICAL COMPLIANCE RULE
 ================================================
 You MUST NEVER send the first message.
-
-If there is no customer message yet:
-Return:
+If there is no customer message yet, return:
 
 {
   "reply": "",
@@ -81,7 +76,7 @@ OUTPUT FORMAT (STRICT JSON)
 ================================================
 
 {
-  "reply": "short human message",
+  "reply": "short message",
   "action": "none" | "ask_for_day" | "ask_for_time" | "book_callback",
   "preferred_date_iso": "...",
   "preferred_time_of_day": "morning" | "afternoon" | "evening" | null
@@ -90,24 +85,24 @@ OUTPUT FORMAT (STRICT JSON)
 ================================================
 PERSONALITY
 ================================================
-
-Short replies (1–3 sentences), friendly + natural.
-No prices, no emojis except 👍.
-No robotic tone, no AI references.
+Short replies (1–3 sentences).
+Warm, helpful, human.
+No emojis except 👍.
+No prices.
+Never explain AI behaviour.
 
 ================================================
-FLOW LOGIC
+LOGIC
 ================================================
-
-If price asked → explain depends → suggest call.
-If booking → ask day → ask time → action="book_callback".
+If price asked → say depends → suggest call.
+If booking → ask day → ask time → then action=book_callback.
 If unclear → ask short clarifying question.
-If no reply → gentle follow-up messages.
+If no reply → gentle follow-up.
 """
 
 
 # ============================================================
-#             CONTACT & CONTEXT HELPERS
+#             CONTACT & PAYLOAD HELPERS
 # ============================================================
 
 def extract_contact_from_payload(payload: dict):
@@ -154,25 +149,17 @@ def extract_contact_from_payload(payload: dict):
 
 
 def extract_message(payload: dict):
-    """Extract customer message from any HL format."""
+    """Pull message text from any HL format."""
+    keys = ["message", "body", "text"]
 
-    checks = [
-        "message",
-        "body",
-        "text",
-        "messageBody",
-        "message.body",
-    ]
+    for k in keys:
+        if isinstance(payload.get(k), str):
+            return payload[k]
 
-    for key in checks:
-        if "." in key:
-            parent, child = key.split(".")
-            if payload.get(parent) and isinstance(payload[parent], dict):
-                if isinstance(payload[parent].get(child), str):
-                    return payload[parent][child]
-        else:
-            if isinstance(payload.get(key), str):
-                return payload[key]
+    if isinstance(payload.get("conversation"), dict):
+        msg = payload["conversation"].get("message")
+        if isinstance(msg, str):
+            return msg
 
     return None
 
@@ -180,26 +167,24 @@ def extract_message(payload: dict):
 
 def build_context_text(payload: dict):
     contact, _ = extract_contact_from_payload(payload)
-
     custom = (
-        payload.get("custom") or
-        payload.get("customFields") or
-        payload.get("custom_fields") or {}
+        payload.get("custom")
+        or payload.get("customFields")
+        or payload.get("custom_fields")
+        or {}
     )
 
     last_message = extract_message(payload)
-
     first_name = contact.get("firstName") or "there"
 
-    lines = []
-
-    # Vehicle info
+    # Vehicle data
     make_model = custom.get("Vehicle Make & Model") or custom.get("vehicle_make_model")
-    colour = custom.get("Vehicle Colour") or custom.get("vehicle_colour")
     year = custom.get("Vehicle Year") or custom.get("vehicle_year")
+    colour = custom.get("Vehicle Colour") or custom.get("vehicle_colour")
     condition = custom.get("Vehicle Condition") or custom.get("vehicle_condition")
     services = custom.get("Services Interested In") or custom.get("services_interested_in")
 
+    lines = []
     lines.append(f"Customer name: {first_name}.")
     lines.append(f"Vehicle: {year or 'unknown year'} {make_model or 'unknown model'} in {colour or 'unknown colour'}.")
 
@@ -211,15 +196,13 @@ def build_context_text(payload: dict):
     if last_message:
         lines.append(f"Latest customer message: {last_message}")
     else:
-        # NOTE: This line is still used for history/follow-up context, but the new logic
-        # in the webhook handler prevents the AI call on first contact.
         lines.append("There is no customer message yet. DO NOT REPLY.")
 
     return "\n".join(lines), contact
 
 
 # ============================================================
-#             CALL OPENAI (JOHN)
+#             CALL OPENAI
 # ============================================================
 
 def call_john(contact_id: str, context_text: str):
@@ -241,11 +224,9 @@ def call_john(contact_id: str, context_text: str):
     try:
         ai = json.loads(content)
     except:
-        # Fallback if OpenAI returns non-JSON content
         print(f"ERROR: Failed to parse JSON from OpenAI. Raw content: {content[:100]}...")
         ai = {"reply": "", "action": "none", "preferred_date_iso": None, "preferred_time_of_day": None}
 
-    # Update conversation history
     history.append({"role": "user", "content": context_text})
     history.append({"role": "assistant", "content": ai.get("reply", "")})
     conversations[contact_id] = {"history": history}
@@ -255,7 +236,7 @@ def call_john(contact_id: str, context_text: str):
 
 
 # ============================================================
-#       SEND MESSAGE BACK INTO HIGHLEVEL
+#           SEND MESSAGE BACK INTO HIGHLEVEL (FIXED)
 # ============================================================
 
 def send_reply_to_highlevel(contact: dict, reply: str):
@@ -266,7 +247,9 @@ def send_reply_to_highlevel(contact: dict, reply: str):
 
     headers = {
         "hl-api-key": HIGHLEVEL_API_KEY,
-        "Content-Type": "application/json"
+        "Version": "2021-07-28", # CRITICAL FIX: Required by HL API for message sending
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
     body = {
@@ -325,19 +308,17 @@ def create_callback_appointment(contact: dict, date_iso: str, time_of_day: str):
 
 
 # ============================================================
-#             WEBHOOK ENDPOINT (JSON + SMS)
+#             WEBHOOK ENDPOINT (FIXED LOGIC)
 # ============================================================
 
 @app.post("/webhook/incoming")
 async def webhook_incoming(request: Request):
 
-    # Try JSON first
     try:
         payload = await request.json()
     except:
         payload = None
 
-    # Try form-data (SMS replies)
     if not payload:
         try:
             form = await request.form()
@@ -354,12 +335,13 @@ async def webhook_incoming(request: Request):
     contact["id"] = contact_id
     
     # ------------------------------------------------------------------
-    # CRITICAL CHANGE: CHECK FOR MESSAGE AND RETURN EARLY IF NONE EXISTS
+    # CRITICAL FIX: STOP EMPTY REPLY ISSUE HERE
     # ------------------------------------------------------------------
     last_message = extract_message(payload)
     
     # If there is NO new customer message AND no prior conversation history, 
-    # return an empty response immediately to follow the "DO NOT SEND FIRST MESSAGE" rule.
+    # return an empty response immediately. This prevents the costly OpenAI call 
+    # which was forced to return {"reply": ""} based on the SYSTEM_PROMPT.
     if not last_message and not conversations.get(contact_id):
         print("INFO: No new customer message and no history. Skipping AI call.")
         return JSONResponse({
@@ -374,14 +356,6 @@ async def webhook_incoming(request: Request):
 
     ai = call_john(contact_id, context_text)
 
-    # HL expects a 200 response with the AI output format
-    final_response = {
-        "reply": ai.get("reply"),
-        "action": ai.get("action"),
-        "preferred_date_iso": ai.get("preferred_date_iso"),
-        "preferred_time_of_day": ai.get("preferred_time_of_day")
-    }
-
     reply = ai.get("reply")
     action = ai.get("action")
     date_iso = ai.get("preferred_date_iso")
@@ -395,5 +369,5 @@ async def webhook_incoming(request: Request):
     if action == "book_callback" and time_of_day:
         create_callback_appointment(contact, date_iso, time_of_day)
 
-    # Return the simple status to the HighLevel workflow engine
+    # Return the final JSON response to the HighLevel workflow engine
     return JSONResponse({"status": "ok"})
