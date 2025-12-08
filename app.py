@@ -196,6 +196,7 @@ def build_context_text(payload: dict):
     if last_message:
         lines.append(f"Latest customer message: {last_message}")
     else:
+        # This line is needed for history checks but is now bypassed by the webhook logic for the first message
         lines.append("There is no customer message yet. DO NOT REPLY.")
 
     return "\n".join(lines), contact
@@ -227,6 +228,7 @@ def call_john(contact_id: str, context_text: str):
         print(f"ERROR: Failed to parse JSON from OpenAI. Raw content: {content[:100]}...")
         ai = {"reply": "", "action": "none", "preferred_date_iso": None, "preferred_time_of_day": None}
 
+    # Update conversation history
     history.append({"role": "user", "content": context_text})
     history.append({"role": "assistant", "content": ai.get("reply", "")})
     conversations[contact_id] = {"history": history}
@@ -308,7 +310,7 @@ def create_callback_appointment(contact: dict, date_iso: str, time_of_day: str):
 
 
 # ============================================================
-#             WEBHOOK ENDPOINT (FIXED LOGIC)
+#             WEBHOOK ENDPOINT (PROACTIVE FIRST MESSAGE)
 # ============================================================
 
 @app.post("/webhook/incoming")
@@ -335,23 +337,30 @@ async def webhook_incoming(request: Request):
     contact["id"] = contact_id
     
     # ------------------------------------------------------------------
-    # CRITICAL FIX: STOP EMPTY REPLY ISSUE HERE
+    # NEW LOGIC: Inject first question if no customer reply is found.
     # ------------------------------------------------------------------
     last_message = extract_message(payload)
     
-    # If there is NO new customer message AND no prior conversation history, 
-    # return an empty response immediately. This prevents the costly OpenAI call 
-    # which was forced to return {"reply": ""} based on the SYSTEM_PROMPT.
+    # Check if this is the absolute start of the conversation (no message, no history).
     if not last_message and not conversations.get(contact_id):
-        print("INFO: No new customer message and no history. Skipping AI call.")
+        
+        # This is the question you want the bot to ask proactively
+        forced_reply = "Great, could you tell me a little more about the condition of the vehicle?"
+        
+        # Send the forced reply to HighLevel immediately.
+        send_reply_to_highlevel(contact, forced_reply)
+        
+        # Return a success response to the HL workflow.
+        print("INFO: No customer message found. Sending forced first question.")
         return JSONResponse({
-            "reply": "",
+            "reply": forced_reply,
             "action": "none",
             "preferred_date_iso": None,
             "preferred_time_of_day": None
         })
     # ------------------------------------------------------------------
 
+    # If a customer message is found, or history exists, proceed to call the AI as normal.
     context_text, contact = build_context_text(payload)
 
     ai = call_john(contact_id, context_text)
@@ -361,7 +370,7 @@ async def webhook_incoming(request: Request):
     date_iso = ai.get("preferred_date_iso")
     time_of_day = ai.get("preferred_time_of_day")
 
-    # Send the reply back to the contact via the HL API
+    # Send the AI's reply back to the contact via the HL API
     if reply:
         send_reply_to_highlevel(contact, reply)
 
