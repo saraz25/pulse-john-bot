@@ -56,15 +56,13 @@ conversations: dict[str, dict] = {}
 
 SYSTEM_PROMPT = """
 You are “John”, a friendly, professional assistant for Pulse Car Detailing.
-You ALWAYS reply in UK English and you act like a real human team member.
+You ALWAYS reply in UK English and sound human, natural, and short.
 
 ================================================
 CRITICAL COMPLIANCE RULE
 ================================================
 You MUST NEVER send the first message.
-
-If there is no customer message yet:
-Return:
+If there is no customer message yet, return:
 
 {
   "reply": "",
@@ -78,7 +76,7 @@ OUTPUT FORMAT (STRICT JSON)
 ================================================
 
 {
-  "reply": "short human message",
+  "reply": "short message",
   "action": "none" | "ask_for_day" | "ask_for_time" | "book_callback",
   "preferred_date_iso": "...",
   "preferred_time_of_day": "morning" | "afternoon" | "evening" | null
@@ -87,24 +85,24 @@ OUTPUT FORMAT (STRICT JSON)
 ================================================
 PERSONALITY
 ================================================
-
-Short replies (1–3 sentences), friendly + natural.
-No prices, no emojis except 👍.
-No robotic tone, no AI references.
+Short replies (1–3 sentences).
+Warm, helpful, human.
+No emojis except 👍.
+No prices.
+Never explain AI behaviour.
 
 ================================================
-FLOW LOGIC
+LOGIC
 ================================================
-
-If price asked → explain depends → suggest call.
-If booking → ask day → ask time → action="book_callback".
+If price asked → say depends → suggest call.
+If booking → ask day → ask time → then action=book_callback.
 If unclear → ask short clarifying question.
-If no reply → gentle follow-up messages.
+If no reply → gentle follow-up.
 """
 
 
 # ============================================================
-#               CONTACT & CONTEXT HELPERS
+#               CONTACT & PAYLOAD HELPERS
 # ============================================================
 
 def extract_contact_from_payload(payload: dict):
@@ -119,13 +117,15 @@ def extract_contact_from_payload(payload: dict):
     )
 
     # Names
-    for key in ["first_name", "firstName"]:
-        if payload.get(key):
-            contact["firstName"] = payload[key]
+    if payload.get("first_name"):
+        contact["firstName"] = payload["first_name"]
+    if payload.get("firstName"):
+        contact["firstName"] = payload["firstName"]
 
-    for key in ["last_name", "lastName"]:
-        if payload.get(key):
-            contact["lastName"] = payload[key]
+    if payload.get("last_name"):
+        contact["lastName"] = payload["last_name"]
+    if payload.get("lastName"):
+        contact["lastName"] = payload["lastName"]
 
     # Location
     if not contact.get("locationId"):
@@ -151,25 +151,17 @@ def extract_contact_from_payload(payload: dict):
 
 
 def extract_message(payload: dict):
-    """Extract customer message from any HL format."""
+    """Pull message text from any HL format."""
+    keys = ["message", "body", "text"]
 
-    checks = [
-        "message",
-        "body",
-        "text",
-        "messageBody",
-        "message.body",
-    ]
+    for k in keys:
+        if isinstance(payload.get(k), str):
+            return payload[k]
 
-    for key in checks:
-        if "." in key:
-            parent, child = key.split(".")
-            if payload.get(parent) and isinstance(payload[parent], dict):
-                if isinstance(payload[parent].get(child), str):
-                    return payload[parent][child]
-        else:
-            if isinstance(payload.get(key), str):
-                return payload[key]
+    if isinstance(payload.get("conversation"), dict):
+        msg = payload["conversation"].get("message")
+        if isinstance(msg, str):
+            return msg
 
     return None
 
@@ -177,26 +169,24 @@ def extract_message(payload: dict):
 
 def build_context_text(payload: dict):
     contact, _ = extract_contact_from_payload(payload)
-
     custom = (
-        payload.get("custom") or
-        payload.get("customFields") or
-        payload.get("custom_fields") or {}
+        payload.get("custom")
+        or payload.get("customFields")
+        or payload.get("custom_fields")
+        or {}
     )
 
     last_message = extract_message(payload)
-
     first_name = contact.get("firstName") or "there"
 
-    lines = []
-
-    # Vehicle info
+    # Vehicle data
     make_model = custom.get("Vehicle Make & Model") or custom.get("vehicle_make_model")
-    colour = custom.get("Vehicle Colour") or custom.get("vehicle_colour")
     year = custom.get("Vehicle Year") or custom.get("vehicle_year")
+    colour = custom.get("Vehicle Colour") or custom.get("vehicle_colour")
     condition = custom.get("Vehicle Condition") or custom.get("vehicle_condition")
     services = custom.get("Services Interested In") or custom.get("services_interested_in")
 
+    lines = []
     lines.append(f"Customer name: {first_name}.")
     lines.append(f"Vehicle: {year or 'unknown year'} {make_model or 'unknown model'} in {colour or 'unknown colour'}.")
 
@@ -215,7 +205,7 @@ def build_context_text(payload: dict):
 
 
 # ============================================================
-#               CALL OPENAI (JOHN)
+#               CALL OPENAI
 # ============================================================
 
 def call_john(contact_id: str, context_text: str):
@@ -247,8 +237,9 @@ def call_john(contact_id: str, context_text: str):
     return ai
 
 
+
 # ============================================================
-#      SEND MESSAGE BACK INTO HIGHLEVEL
+#         SEND MESSAGE BACK INTO HIGHLEVEL (FIXED)
 # ============================================================
 
 def send_reply_to_highlevel(contact: dict, reply: str):
@@ -259,7 +250,9 @@ def send_reply_to_highlevel(contact: dict, reply: str):
 
     headers = {
         "hl-api-key": HIGHLEVEL_API_KEY,
-        "Content-Type": "application/json"
+        "Version": "2021-07-28",     # REQUIRED → Fixes 401 error
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
     body = {
@@ -318,19 +311,17 @@ def create_callback_appointment(contact: dict, date_iso: str, time_of_day: str):
 
 
 # ============================================================
-#               WEBHOOK ENDPOINT (JSON + SMS)
+#               WEBHOOK ENDPOINT
 # ============================================================
 
 @app.post("/webhook/incoming")
 async def webhook_incoming(request: Request):
 
-    # Try JSON first
     try:
         payload = await request.json()
     except:
         payload = None
 
-    # Try form-data (SMS replies)
     if not payload:
         try:
             form = await request.form()
@@ -347,7 +338,6 @@ async def webhook_incoming(request: Request):
     contact["id"] = contact_id
 
     context_text, contact = build_context_text(payload)
-
     ai = call_john(contact_id, context_text)
 
     reply = ai.get("reply")
