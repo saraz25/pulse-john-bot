@@ -10,7 +10,7 @@ from openai import OpenAI
 
 
 # ============================================================
-#             CONFIG
+# CONFIG
 # ============================================================
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
@@ -18,350 +18,261 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 HIGHLEVEL_API_KEY = os.getenv("HIGHLEVEL_API_KEY")
 HIGHLEVEL_LOCATION_ID = os.getenv("HIGHLEVEL_LOCATION_ID")
-HIGHLEVEL_CALENDAR_ID = os.getenv("HIGHLEVEL_CALENDAR_ID", "GJ6IHyj6TLnGTW1iwOsL")
+HIGHLEVEL_CALENDAR_ID = os.getenv("HIGHLEVEL_CALENDAR_ID")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set.")
 if not HIGHLEVEL_API_KEY:
     raise RuntimeError("HIGHLEVEL_API_KEY is not set.")
+if not HIGHLEVEL_CALENDAR_ID:
+    raise RuntimeError("HIGHLEVEL_CALENDAR_ID is not set.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-#             FASTAPI APP + HEALTH CHECK
+# FASTAPI
 # ============================================================
 
 app = FastAPI()
 
 @app.get("/")
-async def health_get():
-    return {"status": "ok", "message": "Pulse John Bot is running"}
-
-@app.head("/")
-async def health_head():
-    return JSONResponse(status_code=200, content={})
+async def health():
+    return {"status": "ok", "service": "Pulse John Bot"}
 
 
 # ============================================================
-#          IN-MEMORY CONVERSATION MEMORY PER CONTACT
+# IN-MEMORY STATE (v1)
 # ============================================================
 
 conversations: dict[str, dict] = {}
+booking_locks: dict[str, bool] = {}
 
 
 # ============================================================
-#             SYSTEM PROMPT FOR JOHN
+# SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are “John”, a friendly, professional assistant for Pulse Car Detailing.
-You ALWAYS reply in UK English and sound human, natural, and short.
+You are John, a friendly and professional assistant for Pulse Car Detailing.
+You speak UK English only and sound human, calm, and natural.
 
-================================================
-CRITICAL COMPLIANCE RULE
-================================================
-You MUST NEVER send the first message.
-If there is no customer message yet, return:
+Rules:
+- Never send the first message.
+- Never confirm a booking as complete.
+- You may say “I’ll get that booked in for you”.
+- Final confirmation is sent only after the system books successfully.
 
-{
-  "reply": "",
-  "action": "none",
-  "preferred_date_iso": null,
-  "preferred_time_of_day": null
-}
-
-================================================
-OUTPUT FORMAT (STRICT JSON)
-================================================
+Output strict JSON only:
 
 {
-  "reply": "short message",
+  "reply": "string",
   "action": "none" | "ask_for_day" | "ask_for_time" | "book_callback",
-  "preferred_date_iso": "...",
-  "preferred_time_of_day": "morning" | "afternoon" | "evening" | null
+  "preferred_date_iso": "YYYY-MM-DD or null",
+  "preferred_time_of_day": "morning" | "afternoon" | null
 }
-
-================================================
-PERSONALITY
-================================================
-Short replies (1–3 sentences).
-Warm, helpful, human.
-No emojis except 👍.
-No prices.
-Never explain AI behaviour.
-
-================================================
-LOGIC
-================================================
-If price asked → say depends → suggest call.
-If booking → ask day → ask time → then action=book_callback.
-If unclear → ask short clarifying question.
-If no reply → gentle follow-up.
 """
 
 
 # ============================================================
-#             CONTACT & PAYLOAD HELPERS
+# HELPERS
 # ============================================================
 
-def extract_contact_from_payload(payload: dict):
-    contact = payload.get("contact") or payload.get("contactDetails") or {}
-    if not isinstance(contact, dict):
-        contact = {}
-
+def extract_contact(payload: dict):
+    contact = payload.get("contact") or {}
     contact_id = (
         contact.get("id")
-        or payload.get("contact_id")
         or payload.get("contactId")
+        or payload.get("contact_id")
     )
 
-    # Names
-    for key in ["first_name", "firstName"]:
-        if payload.get(key):
-            contact["firstName"] = payload[key]
-
-    for key in ["last_name", "lastName"]:
-        if payload.get(key):
-            contact["lastName"] = payload[key]
-
-    # Location
-    if not contact.get("locationId"):
-        loc = payload.get("location")
-        if isinstance(loc, dict) and loc.get("id"):
-            contact["locationId"] = loc["id"]
-        elif payload.get("locationId"):
-            contact["locationId"] = payload["locationId"]
-
-    # Phone
-    contact["phone"] = (
-        contact.get("phone")
-        or payload.get("phone")
-        or payload.get("phoneNumber")
-        or payload.get("phone_number")
-    )
-
-    # Email
+    contact["id"] = contact_id
+    contact["phone"] = contact.get("phone") or payload.get("phone")
     contact["email"] = contact.get("email") or payload.get("email")
+    contact["locationId"] = contact.get("locationId") or payload.get("locationId")
 
     return contact, contact_id
 
+
 def extract_message(payload: dict):
-    # Most common HL default payload locations
     if isinstance(payload.get("message"), dict):
-        if payload["message"].get("body"):
-            return payload["message"]["body"]
+        return payload["message"].get("body")
+    return payload.get("body") or payload.get("text")
 
-    if isinstance(payload.get("body"), str):
-        return payload["body"]
 
-    if isinstance(payload.get("text"), str):
-        return payload["text"]
+def build_context(payload: dict):
+    contact, _ = extract_contact(payload)
+    msg = extract_message(payload)
 
-    if isinstance(payload.get("conversation"), dict):
-        msg = payload["conversation"].get("lastMessage") or payload["conversation"].get("message")
-        if isinstance(msg, str):
-            return msg
+    name = contact.get("firstName", "there")
+
+    lines = [f"Customer name: {name}."]
+    if msg:
+        lines.append(f"Latest customer message: {msg}")
+    else:
+        lines.append("There is no customer message yet. DO NOT REPLY.")
+
+    return "\n".join(lines)
+
+
+def resolve_natural_date(text: str):
+    if not text:
+        return None
+
+    today = datetime.now(ZoneInfo("Europe/London")).date()
+    t = text.lower()
+
+    if "today" in t:
+        return today.isoformat()
+    if "tomorrow" in t:
+        return (today.replace(day=today.day + 1)).isoformat()
 
     return None
 
 
-def build_context_text(payload: dict):
-    contact, _ = extract_contact_from_payload(payload)
-    custom = (
-        payload.get("custom")
-        or payload.get("customFields")
-        or payload.get("custom_fields")
-        or {}
+def get_available_slots(date_iso: str):
+    resp = requests.get(
+        "https://rest.gohighlevel.com/v1/appointments/slots",
+        headers={"hl-api-key": HIGHLEVEL_API_KEY},
+        params={
+            "calendarId": HIGHLEVEL_CALENDAR_ID,
+            "startDate": date_iso,
+            "endDate": date_iso,
+            "timezone": "Europe/London",
+        },
+        timeout=15,
     )
 
-    last_message = extract_message(payload)
-    first_name = contact.get("firstName") or "there"
+    if resp.status_code != 200:
+        return []
 
-    # Vehicle data
-    make_model = custom.get("Vehicle Make & Model") or custom.get("vehicle_make_model")
-    year = custom.get("Vehicle Year") or custom.get("vehicle_year")
-    colour = custom.get("Vehicle Colour") or custom.get("vehicle_colour")
-    condition = custom.get("Vehicle Condition") or custom.get("vehicle_condition")
-    services = custom.get("Services Interested In") or custom.get("services_interested_in")
-
-    lines = []
-    lines.append(f"Customer name: {first_name}.")
-    lines.append(f"Vehicle: {year or 'unknown year'} {make_model or 'unknown model'} in {colour or 'unknown colour'}.")
-
-    if services:
-        lines.append(f"Services: {services}.")
-    if condition:
-        lines.append(f"Condition: {condition}.")
-
-    if last_message:
-        lines.append(f"Latest customer message: {last_message}")
-    else:
-        lines.append("There is no customer message yet. DO NOT REPLY.")
-
-    return "\n".join(lines), contact
+    return resp.json().get("slots", [])
 
 
-# ============================================================
-#             CALL OPENAI
-# ============================================================
+def pick_slot(slots, time_of_day):
+    for slot in slots:
+        dt = datetime.fromisoformat(slot)
+        if time_of_day == "morning" and dt.hour < 12:
+            return slot
+        if time_of_day == "afternoon" and dt.hour >= 12:
+            return slot
+    return None
 
-def call_john(contact_id: str, context_text: str):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+def book_appointment(contact, slot_iso):
+    resp = requests.post(
+        "https://rest.gohighlevel.com/v1/appointments/",
+        headers={"hl-api-key": HIGHLEVEL_API_KEY},
+        json={
+            "locationId": contact.get("locationId") or HIGHLEVEL_LOCATION_ID,
+            "calendarId": HIGHLEVEL_CALENDAR_ID,
+            "selectedSlot": slot_iso,
+            "selectedTimezone": "Europe/London",
+            "name": contact.get("firstName", ""),
+            "phone": contact.get("phone"),
+            "email": contact.get("email"),
+        },
+        timeout=20,
+    )
+    return resp.status_code in (200, 201)
+
+
+def send_reply(contact, text):
+    if not text:
+        return
+
+    requests.post(
+        "https://services.leadconnectorhq.com/conversations/messages",
+        headers={
+            "hl-api-key": HIGHLEVEL_API_KEY,
+            "Authorization": f"Bearer {HIGHLEVEL_API_KEY}",
+            "Version": "2021-07-28",
+            "Content-Type": "application/json",
+        },
+        json={
+            "locationId": contact.get("locationId") or HIGHLEVEL_LOCATION_ID,
+            "contactId": contact.get("id"),
+            "type": "SMS",
+            "message": text,
+            "source": "api",
+        },
+        timeout=15,
+    )
+
+
+def call_john(contact_id: str, context: str):
     history = conversations.get(contact_id, {}).get("history", [])
-    messages.extend(history[-6:])
-    messages.append({"role": "user", "content": context_text})
 
-    completion = client.chat.completions.create(
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history[-6:])
+    messages.append({"role": "user", "content": context})
+
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         response_format={"type": "json_object"},
         temperature=0.4,
     )
 
-    content = completion.choices[0].message.content
+    data = json.loads(resp.choices[0].message.content)
 
-    try:
-        ai = json.loads(content)
-    except:
-        print(f"ERROR: Failed to parse JSON from OpenAI. Raw content: {content[:100]}...")
-        ai = {"reply": "", "action": "none", "preferred_date_iso": None, "preferred_time_of_day": None}
-
-    # Update conversation history
-    history.append({"role": "user", "content": context_text})
-    history.append({"role": "assistant", "content": ai.get("reply", "")})
+    history.append({"role": "user", "content": context})
+    history.append({"role": "assistant", "content": data.get("reply", "")})
     conversations[contact_id] = {"history": history}
 
-    print("AI OUTPUT:", ai)
-    return ai
+    return data
 
 
 # ============================================================
-#           SEND MESSAGE BACK INTO HIGHLEVEL (FIXED AUTHORIZATION)
-# ============================================================
-
-def send_reply_to_highlevel(contact: dict, reply: str):
-    if not reply:
-        return
-
-    url = "https://services.leadconnectorhq.com/conversations/messages"
-
-    headers = {
-        "hl-api-key": HIGHLEVEL_API_KEY, 
-        "Authorization": f"Bearer {HIGHLEVEL_API_KEY}", # CRITICAL FIX for 401 Error
-        "Version": "2021-07-28", 
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    body = {
-        "locationId": contact.get("locationId") or HIGHLEVEL_LOCATION_ID,
-        "contactId": contact.get("id"),
-        "type": "SMS",
-        "message": reply,
-        "source": "api",
-    }
-
-    print("Sending HL reply:", body)
-    resp = requests.post(url, headers=headers, json=body, timeout=15)
-    
-    # Check for success (200 or 201) before printing status
-    if resp.status_code in [200, 201]:
-        print(f"HL REPLY STATUS: {resp.status_code} - Message sent successfully.")
-    else:
-        print(f"HL REPLY STATUS: {resp.status_code} - ERROR: {resp.text[:500]}")
-    
-
-
-# ============================================================
-#             CREATE CALLBACK APPOINTMENT
-# ============================================================
-
-def create_callback_appointment(contact: dict, date_iso: str, time_of_day: str):
-    if not date_iso:
-        return
-
-    try:
-        base_date = datetime.fromisoformat(date_iso)
-    except:
-        print("Invalid date:", date_iso)
-        return
-
-    hour = {"morning": 10, "afternoon": 14, "evening": 18}.get(time_of_day, 14)
-
-    dt_local = base_date.replace(
-        hour=hour, minute=0, second=0, microsecond=0,
-        tzinfo=ZoneInfo("Europe/London")
-    )
-
-    payload = {
-        "locationId": HIGHLEVEL_LOCATION_ID,
-        "calendarId": HIGHLEVEL_CALENDAR_ID,
-        "selectedSlot": dt_local.isoformat(),
-        "selectedTimezone": "Europe/London",
-        "name": (contact.get("firstName","") + " " + contact.get("lastName","")).strip(),
-        "email": contact.get("email"),
-        "phone": contact.get("phone"),
-    }
-
-    url = "https://rest.gohighlevel.com/v1/appointments/"
-    headers = {
-        "hl-api-key": HIGHLEVEL_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
-    print("APPOINTMENT STATUS:", resp.status_code, resp.text[:500])
-
-
-# ============================================================
-#             WEBHOOK ENDPOINT (PROACTIVE FIRST MESSAGE)
+# WEBHOOK
 # ============================================================
 
 @app.post("/webhook/incoming")
-async def webhook_incoming(request: Request):
+async def webhook(request: Request):
 
-    try:
-        payload = await request.json()
-    except:
-        payload = None
+    payload = await request.json()
+    contact, contact_id = extract_contact(payload)
 
-    if not payload:
-        try:
-            form = await request.form()
-            payload = dict(form)
-        except:
-            raise HTTPException(status_code=400, detail="Invalid HL payload format")
-
-    print("RAW HL PAYLOAD:", json.dumps(payload)[:800])
-
-    contact, contact_id = extract_contact_from_payload(payload)
     if not contact_id:
-        raise HTTPException(status_code=400, detail="Missing contactId/contact_id")
+        raise HTTPException(status_code=400, detail="Missing contactId")
 
-    contact["id"] = contact_id
-    
-    # ------------------------------------------------------------------
+    if conversations.get(contact_id, {}).get("booked"):
+        return JSONResponse({"status": "already-booked"})
 
-    # If a customer message is found, or history exists, proceed to call the AI as normal.
-    context_text, contact = build_context_text(payload)
-
-    ai = call_john(contact_id, context_text)
+    context = build_context(payload)
+    ai = call_john(contact_id, context)
 
     reply = ai.get("reply")
     action = ai.get("action")
-    date_iso = ai.get("preferred_date_iso")
     time_of_day = ai.get("preferred_time_of_day")
 
-    # Send the AI's reply back to the contact via the HL API
+    date_iso = ai.get("preferred_date_iso") or resolve_natural_date(
+        extract_message(payload)
+    )
+
     if reply:
-        send_reply_to_highlevel(contact, reply)
+        send_reply(contact, reply)
 
-    # Create the callback appointment if the action is set
-    if action == "book_callback" and time_of_day:
-        create_callback_appointment(contact, date_iso, time_of_day)
+    if action == "book_callback" and date_iso and time_of_day:
 
-    # Return the final JSON response to the HighLevel workflow engine
+        if booking_locks.get(contact_id):
+            return JSONResponse({"status": "locked"})
+
+        booking_locks[contact_id] = True
+
+        try:
+            slots = get_available_slots(date_iso)
+            slot = pick_slot(slots, time_of_day)
+
+            if slot and book_appointment(contact, slot):
+                conversations.setdefault(contact_id, {})["booked"] = True
+                send_reply(contact, "All set 👍 one of the team will give you a call then.")
+            else:
+                send_reply(
+                    contact,
+                    "I can’t see availability at that time — would another day or time work?"
+                )
+        finally:
+            booking_locks.pop(contact_id, None)
+
     return JSONResponse({"status": "ok"})
