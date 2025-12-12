@@ -146,23 +146,24 @@ def extract_contact_from_payload(payload: dict):
 
     return contact, contact_id
 
-
-
 def extract_message(payload: dict):
-    """Pull message text from any HL format."""
-    keys = ["message", "body", "text"]
+    # Most common HL default payload locations
+    if isinstance(payload.get("message"), dict):
+        if payload["message"].get("body"):
+            return payload["message"]["body"]
 
-    for k in keys:
-        if isinstance(payload.get(k), str):
-            return payload[k]
+    if isinstance(payload.get("body"), str):
+        return payload["body"]
+
+    if isinstance(payload.get("text"), str):
+        return payload["text"]
 
     if isinstance(payload.get("conversation"), dict):
-        msg = payload["conversation"].get("message")
+        msg = payload["conversation"].get("lastMessage") or payload["conversation"].get("message")
         if isinstance(msg, str):
             return msg
 
     return None
-
 
 
 def build_context_text(payload: dict):
