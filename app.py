@@ -343,28 +343,6 @@ async def webhook_incoming(request: Request):
     contact["id"] = contact_id
     
     # ------------------------------------------------------------------
-    # NEW LOGIC: Inject first question if no customer reply is found.
-    # ------------------------------------------------------------------
-    last_message = extract_message(payload)
-    
-    # Check if this is the absolute start of the conversation (no message, no history).
-    if not last_message and not conversations.get(contact_id):
-        
-        # This is the question you want the bot to ask proactively
-        forced_reply = "Great, could you tell me a little more about the condition of the vehicle?"
-        
-        # Send the forced reply to HighLevel immediately. This uses the fixed headers.
-        send_reply_to_highlevel(contact, forced_reply)
-        
-        # Return a success response to the HL workflow.
-        print("INFO: No customer message found. Sending forced first question.")
-        return JSONResponse({
-            "reply": forced_reply,
-            "action": "none",
-            "preferred_date_iso": None,
-            "preferred_time_of_day": None
-        })
-    # ------------------------------------------------------------------
 
     # If a customer message is found, or history exists, proceed to call the AI as normal.
     context_text, contact = build_context_text(payload)
